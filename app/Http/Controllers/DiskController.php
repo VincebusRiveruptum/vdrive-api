@@ -2,14 +2,19 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\Disk\StoreFileRequest;
+use App\Http\Requests\Disk\StoreFolderRequest;
+use App\Http\Resources\FileResource;
+use App\Http\Resources\FolderResource;
 use App\Models\File;
 use App\Models\Folder;
 use Illuminate\Http\Request;
-use Inertia\Inertia;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Http\JsonResponse;
 
 class DiskController extends Controller
 {
-    public function index(Request $request)
+    public function index(Request $request): JsonResponse
     {
         $user = $request->user();
         $folderId = $request->input('folder');
@@ -39,39 +44,26 @@ class DiskController extends Controller
         $storageUsed = File::where('user_id', $user->id)->sum('size');
         $storageLimit = 16 * 1024 * 1024 * 1024; // 16GB estático por ahora
 
-        return Inertia::render('disk/views/Dashboard', [
-            'initialFolders' => $folders,
-            'initialFiles' => $files->map(function ($file) {
-                return [
-                    'id' => $file->id,
-                    'name' => $file->name,
-                    'size' => $this->formatSize($file->size),
-                    'type' => $this->getFileType($file->mime_type),
-                    'updated' => $file->updated_at->diffForHumans(),
-                ];
-            }),
-            'storageUsed' => (int) $storageUsed,
-            'storageLimit' => $storageLimit,
+        return response()->json([
+            'folders' => FolderResource::collection($folders),
+            'files' => FileResource::collection($files),
+            'storage' => [
+                'used' => (int) $storageUsed,
+                'limit' => $storageLimit
+            ],
             'breadcrumbs' => $breadcrumbs,
-            'currentFolderId' => $folderId,
+            'current_folder_id' => $folderId
         ]);
     }
 
-    public function store(Request $request)
+    public function store(StoreFileRequest $request): JsonResponse
     {
-        $request->validate([
-            'file' => 'required|file|max:102400', // Máximo 100MB por ahora
-            'folder_id' => 'nullable|exists:folders,id'
-        ]);
-
         $user = $request->user();
         $upload = $request->file('file');
         
-        // Almacenar físicamente (usando el disco 'local' que es storage/app)
-        // Guardamos en una carpeta privada por usuario
         $path = $upload->store("users/{$user->id}/files");
 
-        File::create([
+        $file = File::create([
             'name' => $upload->getClientOriginalName(),
             'path' => $path,
             'size' => $upload->getSize(),
@@ -80,49 +72,50 @@ class DiskController extends Controller
             'folder_id' => $request->input('folder_id'),
         ]);
 
-        return back()->with('success', 'Archivo subido correctamente.');
+        return response()->json([
+            'message' => 'File uploaded successfully',
+            'file' => new FileResource($file)
+        ], 201);
     }
 
     public function download(File $file)
     {
         if ($file->user_id !== auth()->id()) {
-            abort(403);
+            abort(403, 'Unauthorized action.');
         }
 
-        return \Illuminate\Support\Facades\Storage::disk('local')->download($file->path, $file->name);
+        return Storage::disk('local')->download($file->path, $file->name);
     }
 
-    public function storeFolder(Request $request)
+    public function storeFolder(StoreFolderRequest $request): JsonResponse
     {
-        $request->validate([
-            'name' => 'required|string|max:255',
-            'parent_id' => 'nullable|exists:folders,id'
-        ]);
-
-        Folder::create([
+        $folder = Folder::create([
             'name' => $request->name,
             'parent_id' => $request->parent_id,
             'user_id' => auth()->id(),
         ]);
 
-        return back()->with('success', 'Carpeta creada correctamente.');
+        return response()->json([
+            'message' => 'Folder created successfully',
+            'folder' => new FolderResource($folder)
+        ], 201);
     }
 
-    public function destroy(File $file)
+    public function destroy(File $file): JsonResponse
     {
         if ($file->user_id !== auth()->id()) {
             abort(403);
         }
 
-        // Eliminar físicamente
-        \Illuminate\Support\Facades\Storage::delete($file->path);
-
+        Storage::delete($file->path);
         $file->delete();
 
-        return back()->with('success', 'Archivo eliminado.');
+        return response()->json([
+            'message' => 'File deleted successfully'
+        ], 200);
     }
 
-    public function destroyFolder(Folder $folder)
+    public function destroyFolder(Folder $folder): JsonResponse
     {
         if ($folder->user_id !== auth()->id()) {
             abort(403);
@@ -130,39 +123,39 @@ class DiskController extends Controller
 
         $this->recursiveDelete($folder);
 
-        return back()->with('success', 'Carpeta eliminada.');
+        return response()->json([
+            'message' => 'Folder deleted successfully'
+        ], 200);
+    }
+
+    // The rename and copy features were present in API routes. 
+    // Creating basic stubs here to prevent route compilation errors.
+    public function renameFile(Request $request, File $file): JsonResponse
+    {
+        return response()->json(['message' => 'Not implemented in this API version yet'], 501);
+    }
+
+    public function renameFolder(Request $request, Folder $folder): JsonResponse
+    {
+        return response()->json(['message' => 'Not implemented in this API version yet'], 501);
+    }
+
+    public function copyItem(Request $request): JsonResponse
+    {
+        return response()->json(['message' => 'Not implemented in this API version yet'], 501);
     }
 
     private function recursiveDelete(Folder $folder)
     {
-        // Eliminar archivos físicamente y de la BD
         foreach ($folder->files as $file) {
-            \Illuminate\Support\Facades\Storage::delete($file->path);
+            Storage::delete($file->path);
             $file->delete();
         }
 
-        // Eliminar subcarpetas recursivamente
         foreach ($folder->children as $subfolder) {
             $this->recursiveDelete($subfolder);
         }
 
         $folder->delete();
-    }
-
-    private function formatSize($bytes)
-    {
-        if ($bytes === 0) return '0 Bytes';
-        $k = 1024;
-        $sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-        $i = floor(log($bytes) / log($k));
-        return round($bytes / pow($k, $i), 2) . ' ' . $sizes[$i];
-    }
-
-    private function getFileType($mime)
-    {
-        if (str_contains($mime, 'image')) return 'Imagen';
-        if (str_contains($mime, 'pdf')) return 'PDF';
-        if (str_contains($mime, 'text')) return 'Texto';
-        return 'Archivo';
     }
 }
