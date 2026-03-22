@@ -4,6 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\Disk\StoreFileRequest;
 use App\Http\Requests\Disk\StoreFolderRequest;
+use App\Http\Requests\Disk\RenameItemRequest;
+use App\Http\Requests\Disk\CopyItemRequest;
 use App\Http\Resources\FileResource;
 use App\Http\Resources\FolderResource;
 use App\Models\File;
@@ -128,21 +130,92 @@ class DiskController extends Controller
         ], 200);
     }
 
-    // The rename and copy features were present in API routes. 
-    // Creating basic stubs here to prevent route compilation errors.
-    public function renameFile(Request $request, File $file): JsonResponse
+    public function renameFile(RenameItemRequest $request, File $file): JsonResponse
     {
-        return response()->json(['message' => 'Not implemented in this API version yet'], 501);
+        if ($file->user_id !== auth()->id()) abort(403);
+        $file->update(['name' => $request->name]);
+        return response()->json(['message' => 'Archivo renombrado ok', 'file' => new FileResource($file)]);
     }
 
-    public function renameFolder(Request $request, Folder $folder): JsonResponse
+    public function renameFolder(RenameItemRequest $request, Folder $folder): JsonResponse
     {
-        return response()->json(['message' => 'Not implemented in this API version yet'], 501);
+        if ($folder->user_id !== auth()->id()) abort(403);
+        $folder->update(['name' => $request->name]);
+        return response()->json(['message' => 'Carpeta renombrada', 'folder' => new FolderResource($folder)]);
     }
 
-    public function copyItem(Request $request): JsonResponse
+    public function copyItem(CopyItemRequest $request): JsonResponse
     {
-        return response()->json(['message' => 'Not implemented in this API version yet'], 501);
+        $userId = auth()->id();
+        $targetFolderId = $request->input('destination_folder_id');
+
+        if ($targetFolderId) {
+            $dest = Folder::findOrFail($targetFolderId);
+            if ($dest->user_id !== $userId) abort(403);
+        }
+
+        if ($request->input('type') === 'file') {
+            $file = File::findOrFail($request->input('item_id'));
+            if ($file->user_id !== $userId) abort(403);
+
+            $newPath = 'users/' . $userId . '/files/' . \Illuminate\Support\Str::uuid() . '.' . pathinfo($file->path, PATHINFO_EXTENSION);
+            Storage::copy($file->path, $newPath);
+
+            $newFile = $file->replicate();
+            $newFile->path = $newPath;
+            $newFile->folder_id = $targetFolderId;
+            $newFile->name = $newFile->name . ' - copia';
+            $newFile->save();
+
+            return response()->json(['message' => 'Archivo copiado', 'item' => new FileResource($newFile)]);
+        } else {
+            $folder = Folder::findOrFail($request->input('item_id'));
+            if ($folder->user_id !== $userId) abort(403);
+            
+            if ($this->isChildOf($targetFolderId, $folder->id)) {
+                return response()->json(['message' => 'Carpeta destino inválida'], 422);
+            }
+
+            $newFolder = $this->recursiveCopy($folder, $targetFolderId, $userId);
+            $newFolder->update(['name' => $folder->name . ' - copia']);
+
+            return response()->json(['message' => 'Carpeta copiada completada', 'item' => new FolderResource($newFolder)]);
+        }
+    }
+
+    private function isChildOf($targetId, $folderId) {
+        if (!$targetId) return false;
+        if ($targetId == $folderId) return true;
+        
+        $current = Folder::find($targetId);
+        while ($current) {
+            if ($current->parent_id == $folderId) return true;
+            $current = $current->parent;
+        }
+        return false;
+    }
+
+    private function recursiveCopy(Folder $folder, $destinationId, $userId) {
+        $newFolder = $folder->replicate();
+        $newFolder->parent_id = $destinationId;
+        $newFolder->save();
+
+        foreach ($folder->files as $file) {
+            $newPath = 'users/' . $userId . '/files/' . \Illuminate\Support\Str::uuid() . '.' . pathinfo($file->path, PATHINFO_EXTENSION);
+            if (Storage::exists($file->path)) {
+                Storage::copy($file->path, $newPath);
+                $newFile = $file->replicate();
+                $newFile->path = $newPath;
+                $newFile->folder_id = $newFolder->id;
+                $newFile->save();
+            }
+        }
+
+        foreach ($folder->children as $subfolder) {
+            $this->recursiveCopy($subfolder, $newFolder->id, $userId);
+        }
+
+        return $newFolder;
     }
 
     private function recursiveDelete(Folder $folder)
